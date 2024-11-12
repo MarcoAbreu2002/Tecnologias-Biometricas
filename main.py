@@ -19,8 +19,7 @@ def main_menu():
         
         elif choice == '2':
             image_path = input("Enter the path to the image for authentication: ")
-            (matches, non_matches), time_taken = authenticate_face(image_path)
-            print(f"Authentication completed in {time_taken:.4f} seconds.")
+            matches, non_matches = authenticate_face(image_path)  # Only unpack matches and non_matches
             print("\n--- Authentication Results ---")
             if matches:
                 print("Matches found:")
@@ -39,6 +38,7 @@ def main_menu():
             break
         else:
             print("Invalid choice. Please try again.")
+
 
 if __name__ == "__main__":
     main_menu()
