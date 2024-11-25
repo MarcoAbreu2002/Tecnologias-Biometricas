@@ -59,3 +59,5 @@
 2024-11-09 18:03:22 - Executed store_face_embedding in 0.2897 seconds
 2024-11-09 18:03:30 - Stored embedding for Obama from obama.jpg
 2024-11-09 18:03:30 - Executed store_face_embedding in 0.8692 seconds
+2024-11-21 15:58:23 - Stored embedding for random from ./images/random.jpg
+2024-11-21 15:58:23 - Executed store_face_embedding in 0.0969 seconds
