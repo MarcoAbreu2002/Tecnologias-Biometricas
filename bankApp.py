@@ -1,29 +1,48 @@
+# Standard Library Imports
 import sqlite3
-from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, Frame, simpledialog, Toplevel
 import time
-import joblib
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from math import sqrt
 import os
 import smtplib
+import string
+import ssl
+import threading
+import logging
+from math import sqrt
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.message import EmailMessage
+import io
+
+# GUI (Tkinter) Related Imports
+from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, Frame, simpledialog, Toplevel
+from PIL import Image, ImageTk
+
+# Data Handling and ML Libraries
+import numpy as np
+import pandas as pd
+import joblib
+import pickle
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+from io import BytesIO
+
+# Security Imports
+from security import generate_key, decrypt_data, verify_password, hash_password, encrypt_data
+
+# API and Networking
+import requests
+
+# Image Processing
 import cv2
 import face_recognition
-import numpy as np
-import threading
-from security import generate_key, decrypt_data, verify_password, hash_password, encrypt_data
-import requests
-import string
 
 
 # Global idle timer
 last_activity_time = time.time()
 is_idle = False
 is_logged = False
-idle_timeout = 10  # 2 minutes in seconds
+idle_timeout = 10  
 
 current_user = None
 
@@ -58,6 +77,15 @@ CREATE TABLE IF NOT EXISTS keystrokes (
 """)
 conn.commit()
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS models (
+    user_id INTEGER PRIMARY KEY,
+    model_blob BLOB
+);
+
+""")
+conn.commit()
+
 def reset_idle_timer(event=None):
     """Reset the idle timer on any user interaction."""
     global last_activity_time
@@ -88,12 +116,6 @@ def idle_prompt():
         messagebox.showerror("Error", "Face authentication failed. Session locked.")
         logout()  # Or redirect to login
 
-
-from email.message import EmailMessage
-import ssl
-import smtplib
-
-import threading
 
 def send_security_alert_in_background(user_email):
     thread = threading.Thread(target=send_security_alert, args=(user_email,))
@@ -129,7 +151,7 @@ def send_security_alert(user_email):
         smtp.sendmail(EMAIL_SENDER, user_email, em.as_string())
 
 
-def register_face(username):
+def register_face(username, conn=None):
     """Register the user's face securely using their encrypted email."""
     # Ask for permission to access the camera
     response = messagebox.askquestion(
@@ -138,17 +160,17 @@ def register_face(username):
     )
     if response != 'yes':
         messagebox.showerror("Error", "Camera access denied.")
-        return
+        return False
 
     print("Please face the camera to register your face.")
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         messagebox.showerror("Error", "Unable to access the camera. Check permissions.")
-        return
+        return False
 
     registered = False
     retries = 0
-    max_retries = 10  # Reduce retries to 10 to limit resource usage
+    max_retries = 10  # Limit retries to avoid resource drain
 
     try:
         while not registered and retries < max_retries:
@@ -167,16 +189,20 @@ def register_face(username):
                 # Encrypt and save the face embedding
                 face_embedding = np.array(face_encodings[0], dtype=np.float64).tobytes()
 
-                with sqlite3.connect(db_path) as conn:
-                    cursor = conn.cursor()
-                    encryption_key = load_aes_key()
-                    cursor.execute(
-                       'UPDATE users SET face_embedding=? WHERE username=?',
-                        (sqlite3.Binary(face_embedding), username)
-                    )
-                    conn.commit()
+                # Use the provided connection to avoid locking
+                if conn is None:
+                    conn = sqlite3.connect(db_path, timeout=10)
+
+                cursor = conn.cursor()
+                encryption_key = load_aes_key()
+                cursor.execute(
+                    'UPDATE users SET face_embedding=? WHERE username=?',
+                    (sqlite3.Binary(face_embedding), username)
+                )
+                conn.commit()
 
                 print("Face registered successfully!")
+                messagebox.showinfo("Success", "Face registered successfully!")
                 registered = True
             else:
                 print("Ensure only your face is visible and retry.")
@@ -189,13 +215,16 @@ def register_face(username):
         if not registered:
             print("Face registration failed. Please try again.")
             messagebox.showerror("Error", "Face registration failed.")
+            return False
     except Exception as e:
         print(f"Unexpected error occurred: {e}")
         messagebox.showerror("Error", f"An unexpected error occurred: {e}")
+        return False
     finally:
         cap.release()
         cv2.destroyAllWindows()
 
+    return True
 
 
 def authenticate_face(username):
@@ -220,8 +249,8 @@ def authenticate_face(username):
     try:
         while not authenticated and retries < max_retries:
             elapsed_time = time.time() - start_time
-            if elapsed_time > 15:
-                print("Authentication timed out. No face recognized within 15 seconds.")
+            if elapsed_time > 8:
+                print("Authentication timed out. No face recognized within 8 seconds.")
                 cap.release()
                 cv2.destroyAllWindows()
                 return None
@@ -282,8 +311,6 @@ def authenticate_face(username):
 
 
 
-
-
 # Separate keystroke data for password and confirm password
 password_keystrokes = {"press_times": [], "release_times": []}
 confirm_password_keystrokes = {"press_times": [], "release_times": []}
@@ -318,6 +345,155 @@ def compute_keystroke_features(keystroke_data):
         "rpt_std": calculate_mean_and_std(rpt)[1],
     }
 
+def verify_user(keystroke_data, user_id, threshold=0.75):
+    print(f"Starting verification for user_id: {user_id}")
+    print(f"Received keystroke data: {keystroke_data}")
+
+    # Retrieve the model
+    model = retrieve_user_model(user_id)
+    if model is None:
+        print("Model not found for the given user ID.")
+        return False
+
+    # Debugging: Ensure keystroke_data contains all required keys
+    required_keys = [
+        'ht_mean', 'ht_std', 'ppt_mean', 'ppt_std',
+        'rrt_mean', 'rrt_std', 'rpt_mean', 'rpt_std'
+    ]
+    missing_keys = [key for key in required_keys if key not in keystroke_data]
+    if missing_keys:
+        print(f"Error: Missing required keys in keystroke data: {missing_keys}")
+        raise ValueError(f"Missing keys: {missing_keys}")
+
+    # Extract features
+    features = [keystroke_data[key] for key in required_keys]
+    print(f"Extracted features: {features}")
+
+    # Predict probabilities and class
+    try:
+        probabilities = model.predict_proba([features])[0]   
+        print(f"Prediction probabilities: {probabilities}")
+        predicted_class = model.classes_[np.argmax(probabilities)]
+        print(f"Predicted class: {predicted_class}")
+        print(f"Probability of predicted class: {probabilities[np.argmax(probabilities)]}")
+    except Exception as e:
+        print(f"Error during prediction: {e}")
+        raise
+
+    # Verify against user ID and threshold
+    if predicted_class == user_id and probabilities[np.argmax(probabilities)] >= threshold:
+        print("Verification result: Match")
+        return True
+    else:
+        print("Verification result: No match")
+        return False
+
+def predict_user_model(user_id, new_data, conn):
+    """
+    Predicts the user input using the stored model in the SQLite database.
+
+    :param user_id: The user ID for which the model is stored in the database.
+    :param new_data: A DataFrame containing the new data for prediction.
+    :param conn: An existing SQLite connection object.
+    :return: Prediction result for the given user_id and new_data.
+    """
+    try:
+        # Retrieve the serialized model blob for the given user_id
+        cursor = conn.cursor()
+        cursor.execute("SELECT model_blob FROM models WHERE user_id=?", (user_id,))
+        result = cursor.fetchone()
+
+        if result is None:
+            raise ValueError(f"No model found for user_id: {user_id}")
+
+        # Deserialize the model from the BLOB data
+        model_blob = result[0]
+        model_stream = BytesIO(model_blob)
+        rf_model = joblib.load(model_stream)
+
+        # Ensure the new_data has the same feature columns as the training data
+        features = ['ht_mean', 'ht_std_dev', 'ppt_mean', 'ppt_std_dev', 'rrt_mean', 'rrt_std_dev', 'rpt_mean', 'rpt_std_dev']
+        if not all(feature in new_data.columns for feature in features):
+            raise ValueError("Input data does not have the required features")
+
+        # Prepare the features for prediction (assumes new_data is a DataFrame with correct columns)
+        X_new = new_data[features]
+        
+        # Make predictions using the deserialized model
+        predictions = rf_model.predict(X_new)
+        
+        return predictions
+
+    except Exception as e:
+        print(f"Error during prediction: {e}")
+        raise e
+
+def predict_user(keystroke_data, user_id, conn=None):
+    """
+    Predicts the user based on keystroke data using a model retrieved from the database.
+
+    :param user_id: ID of the user for whom the prediction is made.
+    :param keystroke_data: Raw keystroke data (press and release times).
+    :param db_path: Path to the SQLite database file.
+    :return: Predicted user ID.
+    """
+    # Compute keystroke features
+    feature_vector = [
+        keystroke_data["ht_mean"],
+        keystroke_data["ht_std"],
+        keystroke_data["ppt_mean"],
+        keystroke_data["ppt_std"],
+        keystroke_data["rrt_mean"],
+        keystroke_data["rrt_std"],
+        keystroke_data["rpt_mean"],
+        keystroke_data["rpt_std"]
+    ]
+        # Use the provided connection to avoid locking
+    if conn is None:
+        conn = sqlite3.connect(db_path, timeout=10)
+    # Retrieve the model from the database
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""SELECT model_blob FROM models WHERE user_id = ?""", (user_id,))
+        result = cursor.fetchone()
+
+    if not result:
+        raise ValueError(f"No model found for user ID {user_id}.")
+
+    # Deserialize the model using joblib
+    try:
+        model_stream = BytesIO(result[0])
+        model = joblib.load(model_stream)
+    except Exception as e:
+        raise ValueError(f"Error deserializing the model for user ID {user_id}: {str(e)}")
+
+    # Make a prediction using the retrieved model
+    prediction = model.predict([feature_vector])
+
+    # Return the predicted user ID
+    return prediction[0]
+
+
+
+def retrieve_user_model(user_id):
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT model_blob FROM models WHERE user_id=?", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                model_blob = io.BytesIO(row[0])
+                model = joblib.load(model_blob)
+                return model
+            else:
+                print(f"No model found for user {user_id}.")
+                return None
+    except sqlite3.Error as e:
+        print(f"Error loading model for user {user_id}: {e}")
+        return None
+
+
+
 def reset_keystroke_data():
     """Reset keystroke data after it's processed."""
     global password_keystrokes, confirm_password_keystrokes
@@ -326,41 +502,150 @@ def reset_keystroke_data():
     confirm_password_keystrokes["press_times"] = []
     confirm_password_keystrokes["release_times"] = []
 
-def train_model():
-    cursor.execute("SELECT * FROM keystrokes")
+
+def process_sqlite_data(user_id):
+    # Connect to SQLite database
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Fetch data from the keystrokes table
+    cursor.execute("SELECT * FROM keystrokes WHERE user_id=?", (user_id,))
     rows = cursor.fetchall()
-    if not rows or len(rows) < 2:
-        print("Not enough data to train the model. Need at least 2 samples.")
+
+    # Prepare dictionary to store the data
+    data = {
+        'user_id': [],
+        'ht_mean': [],
+        'ht_std_dev': [],
+        'ppt_mean': [],
+        'ppt_std_dev': [],
+        'rrt_mean': [],
+        'rrt_std_dev': [],
+        'rpt_mean': [],
+        'rpt_std_dev': [],
+    }
+
+    # Process each row from the query result
+    for row in rows:
+        user_id = row[1]  # user_id is in the second column (index 1)
+        ht_mean = row[2]
+        ht_std_dev = row[3]
+        ppt_mean = row[4]
+        ppt_std_dev = row[5]
+        rrt_mean = row[6]
+        rrt_std_dev = row[7]
+        rpt_mean = row[8]
+        rpt_std_dev = row[9]
+
+        # Append the calculated values to the data dictionary
+        data['user_id'].append(user_id)
+        data['ht_mean'].append(ht_mean)
+        data['ht_std_dev'].append(ht_std_dev)
+        data['ppt_mean'].append(ppt_mean)
+        data['ppt_std_dev'].append(ppt_std_dev)
+        data['rrt_mean'].append(rrt_mean)
+        data['rrt_std_dev'].append(rrt_std_dev)
+        data['rpt_mean'].append(rpt_mean)
+        data['rpt_std_dev'].append(rpt_std_dev)
+
+    # Convert the dictionary to a DataFrame
+    data_df = pd.DataFrame(data)
+
+    # Close the database connection
+    conn.close()
+
+    return data_df
+
+logging.basicConfig(level=logging.INFO)
+
+def train_model(user_id):
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM keystrokes WHERE user_id=?", (user_id,))
+            rows = cursor.fetchall()
+
+            if not rows or len(rows) < 2:
+                logging.warning(f"Not enough data to train the model for user_id {user_id}.")
+                return None
+
+            X = [row[2:10] for row in rows]  # Features
+            y = [row[1] for row in rows]     # Labels (user_id)
+
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            logging.info(f"Training data size: {len(X_train)}, Test data size: {len(X_test)}")
+
+            model = RandomForestClassifier(n_estimators=10, max_depth=5, random_state=42)
+            model.fit(X_train, y_train)
+
+            # Log model performance
+            if X_test:
+                y_pred = model.predict(X_test)
+                logging.info(f"Classification Report:\n{classification_report(y_test, y_pred)}")
+            else:
+                logging.warning("No test set available for evaluation.")
+
+            # Serialize and store the model
+            model_blob = io.BytesIO()
+            joblib.dump(model, model_blob)
+            model_blob.seek(0)
+
+            cursor.execute(""" 
+                INSERT INTO models (user_id, model_blob)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET model_blob=excluded.model_blob
+            """, (user_id, model_blob.read()))
+            conn.commit()
+
+            logging.info(f"Model for user_id {user_id} saved successfully.")
+            return model
+
+    except Exception as e:
+        logging.error(f"Error during model training for user_id {user_id}: {e}")
         return None
 
-    # Prepare the data
-    X = []
-    y = []
-    for row in rows:
-        features = row[2:10]  # Exclude id and user_id
-        X.append(features)
-        y.append(row[1])  # user_id as the label
 
+def train_model2(training_data, user_id, db_path, conn=None):
+    """
+    Trains a Random Forest model on the given data and stores it in a SQLite database.
+
+    :param training_data: DataFrame containing training features and user_id
+    :param user_id: The user ID for which the model is being trained
+    :param db_path: Path to the SQLite database file
+    :param conn: SQLite connection object (optional)
+    """
+    features = ['ht_mean', 'ht_std_dev', 'ppt_mean', 'ppt_std_dev', 'rrt_mean', 'rrt_std_dev', 'rpt_mean', 'rpt_std_dev']
+    X = training_data[features]
+    y = training_data['user_id']  # Ensure this is the intended target variable
+
+    # Train a Random Forest model on the data
+    rf_model = RandomForestClassifier()
+    rf_model.fit(X, y)
+
+    # Serialize the model using joblib and store it in memory
+    model_stream = BytesIO()
+    joblib.dump(rf_model, model_stream)
+    model_stream.seek(0)  # Reset stream position to the beginning
+    serialized_model = model_stream.read()
+
+    # Use the provided connection to avoid locking, if conn is not provided, create a new one
+    if conn is None:
+        conn = sqlite3.connect(db_path, timeout=10)
+
+    # Use a context manager to manage the SQLite connection
     try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=min(0.2, len(X) / len(y)), random_state=42
-        )
-    except ValueError:
-        # Fallback to no split if the dataset is too small
-        X_train, X_test, y_train, y_test = X, [], y, []
-
-    model = RandomForestClassifier()
-    model.fit(X_train, y_train)
-
-    # Evaluate the model if there's a test set
-    if X_test:
-        y_pred = model.predict(X_test)
-        print("Model Accuracy:", accuracy_score(y_test, y_pred))
-    else:
-        print("Model trained on full dataset; no test set available for evaluation.")
-
-    joblib.dump(model, "keystroke_model.joblib")
-    return model
+        cursor = conn.cursor()
+        # Insert or update the model in the database
+        cursor.execute("""
+            INSERT INTO models (user_id, model_blob)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET model_blob=excluded.model_blob
+        """, (user_id, serialized_model))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Error storing the model: {e}")
+        raise e
 
 def on_key_press_password(event):
     """Record the timestamp when a key is pressed for the password field."""
@@ -440,9 +725,11 @@ def register_user():
         encryption_key = load_aes_key()
         encrypted_email = encrypt_data(email, encryption_key)
 
-        # Insert user details into the database
-        with sqlite3.connect(db_path) as conn:
+        # Insert user details into the database (transactional approach)
+        with sqlite3.connect(db_path, timeout=10) as conn:
             cursor = conn.cursor()
+
+            # Start a transaction
             cursor.execute(
                 "INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
                 (username, hashed_password, encrypted_email)
@@ -458,14 +745,24 @@ def register_user():
                 INSERT INTO keystrokes (user_id, ht_mean, ht_std, ppt_mean, ppt_std, rrt_mean, rrt_std, rpt_mean, rpt_std)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (user_id, *features_2.values()))
+
+            # Attempt to register face
+            print(f"Registering face for user {username}.")
+            face_registration_success = register_face(username, conn)
+
+            if not face_registration_success:
+                # Rollback if face registration fails
+                print("Face registration failed, rolling back user registration.")
+                conn.rollback()
+                messagebox.showerror("Error", "Face registration failed. User registration aborted.")
+                return
+
+            # Commit the transaction if everything succeeded
             conn.commit()
 
-        # Proceed to face registration
-        print(f"Registering face for encrypted email.")
-        register_face(username)
-
-        # Retrain the model for authentication
-        train_model()
+        # Process and retrain the model after a successful registration
+        training_data = process_sqlite_data(user_id)
+        train_model2(training_data, user_id, conn)
 
         messagebox.showinfo("Success", "Registration successful!")
         reset_keystroke_data()
@@ -476,7 +773,6 @@ def register_user():
     except Exception as e:
         messagebox.showerror("Error", f"An unexpected error occurred: {e}")
         reset_keystroke_data()
-
 
 
 def login_user():
@@ -528,42 +824,40 @@ def login_user():
                 messagebox.showerror("Error", "Invalid keystroke data for the first input!")
                 reset_keystroke_data()
                 return
-
-            try:
-                # Insert keystroke data
-                with sqlite3.connect(db_path) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(""" 
-                        INSERT INTO keystrokes (user_id, ht_mean, ht_std, ppt_mean, ppt_std, rrt_mean, rrt_std, rpt_mean, rpt_std)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (user_id, *features_1.values()))
-                    conn.commit()
-                # Retrain the model
-                train_model()
-                reset_keystroke_data()
-            except sqlite3.IntegrityError:
-                messagebox.showerror("Error", "Failed to insert keystroke data!")
-
-            # Compare keystroke data
-            cursor.execute("SELECT * FROM keystrokes WHERE user_id=?", (user[0],))
-            keystroke_data = cursor.fetchall()
-
             # Assuming the first record contains the features
-            features = compute_keystroke_features(password_keystrokes)  # User's entered password keystrokes
-            db_features = keystroke_data[0][2:]  # Retrieve stored features
-
+            #matched = verify_user(features_1, user_id)
+            matched = predict_user_model(features_1, user_id, conn)
+            if matched:
+                print("There was a match")
             # Optionally, compare features for consistency here (e.g., keystroke analysis)
-            reset_keystroke_data()
-            is_logged = True
-            show_home(username)  # Proceed to the home screen if login is successful
+
+                try:
+                    # Insert keystroke data
+                    with sqlite3.connect(db_path) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(""" 
+                            INSERT INTO keystrokes (user_id, ht_mean, ht_std, ppt_mean, ppt_std, rrt_mean, rrt_std, rpt_mean, rpt_std)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (user_id, *features_1.values()))
+                        conn.commit()
+                    # Retrain the model
+                    training_data = process_sqlite_data(user_id)
+                    train_model2(training_data, user_id, conn)
+                    #train_model(user_id)
+                    #reset_keystroke_data()
+                except sqlite3.IntegrityError:
+                    messagebox.showerror("Error", "Failed to insert keystroke data!")
+
+                reset_keystroke_data()
+                is_logged = True
+                show_home(username)  # Proceed to the home screen if login is successful
+            else:
+                security_flag = True
+                print("keystroke did not match, not saving and turning on security.")
         else:
             messagebox.showerror("Error", "Incorrect password.")
     else:
         messagebox.showerror("Error", "Username not found.")
-
-
-
-
 
 
 def loginAfterIDLE(username):
@@ -786,15 +1080,34 @@ def logout():
 # GUI setup
 app = Tk()
 app.title("Bank App")
-app.geometry("500x400")
-app.configure(bg="#f4f7f6")
+app.geometry("800x600")  # Enlarged window size
+app.configure(bg="#FFFFFF")  # Bank app-themed background color
 
-# Font and style settings
-font_large = ("Helvetica", 16)
-font_medium = ("Helvetica", 12)
-font_small = ("Helvetica", 10)
+# Resize the logo using Pillow
+original_logo = Image.open("logo.png")  
+resized_logo = original_logo.resize((150, 100))  # (width, height)
+logo_img = ImageTk.PhotoImage(resized_logo)
+
+# Add the resized logo
+logo_label = Label(app, image=logo_img, bg="#FFFFFF")
+logo_label.place(x=10, y=10)  # Positioning the logo at the top left corner
+
+# Updated fonts for larger text
+font_large = ("Helvetica", 20, "bold")  # Larger font
+font_medium = ("Helvetica", 16)
+font_small = ("Helvetica", 14)
+
+# Updated button styles for a polished look
 primary_color = "#0d47a1"
-button_color = "#2979ff"
+button_color = "#1565c0"
+button_style = {
+    "bg": button_color,
+    "fg": "white",
+    "font": font_medium,
+    "relief": "solid",
+    "bd": 2
+}
+
 
 # Variables
 reg_username = StringVar()
@@ -807,62 +1120,60 @@ login_password = StringVar()
 
 def disable_copy_paste(event):
     return "break"  # Prevent the event from propagating
-# Registration Frame
-reg_frame = Frame(app, bg="#f4f7f6")
-Label(reg_frame, text="Register", font=font_large, bg="#f4f7f6").pack(pady=10)
-Label(reg_frame, text="Username:", font=font_medium, bg="#f4f7f6").pack()
-Entry(reg_frame, textvariable=reg_username, font=font_small).pack()
-Label(reg_frame, text="Password:", font=font_medium, bg="#f4f7f6").pack()
-reg_password_entry = Entry(reg_frame, textvariable=reg_password, show="*", font=font_small)
+# Updated Registration Frame
+reg_frame = Frame(app, bg="#FFFFFF")
+Label(reg_frame, text="Register", font=font_large, bg="#FFFFFF").pack(pady=20)
+Label(reg_frame, text="Username:", font=font_medium, bg="#FFFFFF").pack()
+Entry(reg_frame, textvariable=reg_username, font=font_medium).pack(pady=5)
+Label(reg_frame, text="Password:", font=font_medium, bg="#FFFFFF").pack()
+reg_password_entry = Entry(reg_frame, textvariable=reg_password, show="*", font=font_medium)
 # Disable copy and paste in the registration password field
 reg_password_entry.bind("<Control-c>", disable_copy_paste)
 reg_password_entry.bind("<Control-v>", disable_copy_paste)
 reg_password_entry.bind("<Button-3>", disable_copy_paste)  # Right-click disable
-reg_password_entry.pack()
+reg_password_entry.pack(pady=5)
 reg_password_entry.bind("<KeyPress>", on_key_press_password)
 reg_password_entry.bind("<KeyRelease>", on_key_release_password)
-
-Label(reg_frame, text="Confirm Password:", font=font_medium, bg="#f4f7f6").pack()
-reg_password_confirm_entry = Entry(reg_frame, textvariable=reg_password_confirm, show="*", font=font_small)
-# Disable copy and paste in the registration password field
+Label(reg_frame, text="Confirm Password:", font=font_medium, bg="#FFFFFF").pack()
+reg_password_confirm_entry = Entry(reg_frame, textvariable=reg_password_confirm, show="*", font=font_medium)
+# Disable copy and paste in the confirmation password field
 reg_password_confirm_entry.bind("<Control-c>", disable_copy_paste)
 reg_password_confirm_entry.bind("<Control-v>", disable_copy_paste)
 reg_password_confirm_entry.bind("<Button-3>", disable_copy_paste)  # Right-click disable
-reg_password_confirm_entry.pack()
+reg_password_confirm_entry.pack(pady=5)
 reg_password_confirm_entry.bind("<KeyPress>", on_key_press_confirm_password)
 reg_password_confirm_entry.bind("<KeyRelease>", on_key_release_confirm_password)
-Label(reg_frame, text="Email:", font=font_medium, bg="#f4f7f6").pack()
-Entry(reg_frame, textvariable=reg_email, font=font_small).pack()
-Button(reg_frame, text="Register", command=register_user, bg=button_color, fg="white", font=font_medium).pack(pady=10)
-Button(reg_frame, text="Go to Login", command=show_login, bg=button_color, fg="white", font=font_medium).pack()
+Label(reg_frame, text="Email:", font=font_medium, bg="#FFFFFF").pack()
+Entry(reg_frame, textvariable=reg_email, font=font_medium).pack(pady=5)
+Button(reg_frame, text="Register", command=register_user, **button_style).pack(pady=15)
+Button(reg_frame, text="Go to Login", command=show_login, **button_style).pack()
 
-# Login Frame
-login_frame = Frame(app, bg="#f4f7f6")
-Label(login_frame, text="Login", font=font_large, bg="#f4f7f6").pack(pady=10)
-Label(login_frame, text="Username:", font=font_medium, bg="#f4f7f6").pack()
-Entry(login_frame, textvariable=login_username, font=font_small).pack()
-Label(login_frame, text="Password:", font=font_medium, bg="#f4f7f6").pack()
-login_password_entry = Entry(login_frame, textvariable=login_password, show="*", font=font_small)
+# Updated Login Frame
+login_frame = Frame(app, bg="#FFFFFF")
+Label(login_frame, text="Login", font=font_large, bg="#FFFFFF").pack(pady=20)
+Label(login_frame, text="Username:", font=font_medium, bg="#FFFFFF").pack()
+Entry(login_frame, textvariable=login_username, font=font_medium).pack(pady=5)
+Label(login_frame, text="Password:", font=font_medium, bg="#FFFFFF").pack()
+login_password_entry = Entry(login_frame, textvariable=login_password, show="*", font=font_medium)
 # Disable copy and paste in the login password field
 login_password_entry.bind("<Control-c>", disable_copy_paste)
 login_password_entry.bind("<Control-v>", disable_copy_paste)
 login_password_entry.bind("<Button-3>", disable_copy_paste)  # Right-click disable
-login_password_entry.pack()
+login_password_entry.pack(pady=5)
 login_password_entry.bind("<KeyPress>", on_key_press_password)
 login_password_entry.bind("<KeyRelease>", on_key_release_password)
-Button(login_frame, text="Login", command=login_user, bg=button_color, fg="white", font=font_medium).pack(pady=10)
-Button(login_frame, text="Go to Register", command=show_register, bg=button_color, fg="white", font=font_medium).pack()
-# Adding the Exit Button to the Login Page
-Button(login_frame, text="Exit", command=app.quit, bg="#e53935", fg="white", font=font_medium).pack(pady=10)
+Button(login_frame, text="Login", command=login_user, **button_style).pack(pady=15)
+Button(login_frame, text="Go to Register", command=show_register, **button_style).pack(pady=5)
+Button(login_frame, text="Exit", command=app.quit, bg="#e53935", fg="white", font=font_medium, relief="solid", bd=2).pack(pady=10)
 
-# Home Frame
-home_frame = Frame(app, bg="#f4f7f6")
-home_label = Label(home_frame, text="", font=font_large, bg="#f4f7f6")
+# Updated Home Frame
+home_frame = Frame(app, bg="#FFFFFF")
+home_label = Label(home_frame, text="", font=font_large, bg="#FFFFFF")
 home_label.pack(pady=20)
-Button(home_frame, text="View Balance", command=open_view_balance, bg=button_color, fg="white", font=font_medium).pack(pady=10)
-Button(home_frame, text="Transfer Funds", command=open_transfer_funds, bg=button_color, fg="white", font=font_medium).pack(pady=10)
-Button(home_frame, text="Transaction History", command=open_transaction_history, bg=button_color, fg="white", font=font_medium).pack(pady=10)
-Button(home_frame, text="Logout", command=logout, bg="#e53935", fg="white", font=font_medium).pack(pady=10)
+Button(home_frame, text="View Balance", command=open_view_balance, **button_style).pack(pady=10)
+Button(home_frame, text="Transfer Funds", command=open_transfer_funds, **button_style).pack(pady=10)
+Button(home_frame, text="Transaction History", command=open_transaction_history, **button_style).pack(pady=10)
+Button(home_frame, text="Logout", command=logout, bg="#e53935", fg="white", font=font_medium, relief="solid", bd=2).pack(pady=10)
 
 
 
